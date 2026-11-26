@@ -1,0 +1,71 @@
+--- a/module/loader.c
++++ b/module/loader.c
+@@ -874,6 +874,19 @@
+ 	return ret;
+ }
+ 
++/* A single load may finish with one persistent SCM mutation. Do not mix
++ * mutations with each other or with execution/physical/CPU/reset tests:
++ * the secure-watchdog API has no inverse for cross-operation rollback.
++ */
++static bool qkx_control_modes_conflict(void)
++{
++	bool mutating = core_hang_control == 2 || secure_watchdog_control == 2;
++
++	return (core_hang_control == 2 && secure_watchdog_control == 2) ||
++		(mutating && (execute || test_transition || test_full_copy ||
++			      test_cpus || warm_reset_test));
++}
++
+ static int __init qkx_init(void)
+ {
+ 	struct file *kf = NULL, *rf = NULL, *df = NULL;
+@@ -895,6 +908,10 @@
+ 			return -ENODEV;
+ 		return qkx_platform_preflight();
+ 	}
++	if (qkx_control_modes_conflict()) {
++		pr_err("quest_kexec: use one SCM mutation per load, without execution/reset/physical tests\n");
++		return -EINVAL;
++	}
+ 	if (test_cpus > 2 || preflight_only > 3 || core_hang_control > 2 ||
+ 	    secure_watchdog_control > 2 || phase_delay_ms > 5000 ||
+ 	    (preflight_only && !execute) || (post_shutdown_probe && !execute) ||
+@@ -934,16 +951,6 @@
+ 		msleep(100);
+ 		restart(NULL);
+ 		return -EIO;
+-	}
+-	if (core_hang_control) {
+-		ret = qkx_core_hang_configure(core_hang_control);
+-		if (ret)
+-			return ret;
+-	}
+-	if (secure_watchdog_control && !(execute && secure_watchdog_control == 2)) {
+-		ret = qkx_secure_watchdog_configure(secure_watchdog_control);
+-		if (ret)
+-			return ret;
+ 	}
+ 	/* Same flags and traversal as walk_system_ram_res(), but exported. */
+ 	ret = walk_iomem_res_desc(IORES_DESC_NONE,
+@@ -1004,8 +1011,19 @@
+ 			ret = qkx_test_full_copy();
+ 		if (test_cpus)
+ 			ret = qkx_test_cpus();
++		/* Complete staging and all read-only checks before the one allowed
++		 * persistent mutation. No fallible step follows a successful write.
++		 */
++		if (!ret && core_hang_control == 1)
++			ret = qkx_core_hang_configure(1);
++		if (!ret && secure_watchdog_control == 1)
++			ret = qkx_secure_watchdog_configure(1);
++		if (!ret && core_hang_control == 2)
++			ret = qkx_core_hang_configure(2);
++		if (!ret && secure_watchdog_control == 2)
++			ret = qkx_secure_watchdog_configure(2);
+ #ifdef QKX_ENABLE_EXPERIMENTAL_JUMP
+-		if (execute) {
++		if (!ret && execute) {
+ 			qkx_phase(0, "entering execute path; resolving shutdown symbols", true);
+ 			ret = qkx_execute();
+ 		}

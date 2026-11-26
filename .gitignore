@@ -1,0 +1,11 @@
+/.work/
+/test-results.json
+__pycache__/
+*.pyc
+.env
+.env.*
+!.env.example
+*.part
+
+# Novas capturas privadas: não publicar automaticamente.
+/private-diagnostics/

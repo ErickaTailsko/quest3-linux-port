@@ -1,0 +1,20 @@
+/* Target-only changes. Apply while compiling a complete DTS, not as a DTBO.
+ * The MSM glue still acquires both PHY objects even at high-speed.
+ */
+&{/soc/ssusb@a600000} {
+    /delete-property/ usb-role-switch;
+};
+&{/soc/ssusb@a600000/dwc3@a600000} {
+    dr_mode = "peripheral";
+    maximum-speed = "high-speed";
+    /delete-property/ usb-role-switch;
+};
+&{/soc/ssusb@a600000/port/endpoint} {
+    /delete-property/ remote-endpoint;
+};
+&{/soc/qcom,pmic_glink/qcom,ucsi} {
+    status = "disabled";
+};
+&{/soc/qcom,pmic_glink/qcom,ucsi/connector/port/endpoint} {
+    /delete-property/ remote-endpoint;
+};

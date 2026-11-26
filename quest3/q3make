@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+set -euo pipefail
+source /workspace/quest3-build/env.sh
+exec make -C "$Q3_ROOT/kernel" O="$Q3_ROOT/out" \
+    ARCH=arm64 LLVM=1 LLVM_IAS=1 \
+    CROSS_COMPILE=aarch64-linux-gnu- CLANG_TRIPLE=aarch64-linux-gnu- \
+    CC="$Q3_LLVM/clang" LD="$Q3_LLVM/ld.lld" \
+    AR="$Q3_LLVM/llvm-ar" NM="$Q3_LLVM/llvm-nm" \
+    OBJCOPY="$Q3_LLVM/llvm-objcopy" OBJDUMP="$Q3_LLVM/llvm-objdump" \
+    READELF="$Q3_LLVM/llvm-readelf" STRIP="$Q3_LLVM/llvm-strip" \
+    HOSTCC="$Q3_LLVM/clang" HOSTCXX="$Q3_LLVM/clang++" \
+    PAHOLE="$Q3_ROOT/pahole-build/pahole" \
+    LOCALVERSION=-gd7102a837402 "$@"

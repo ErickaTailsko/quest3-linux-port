@@ -1,0 +1,108 @@
+--- a/module/loader.c
++++ b/module/loader.c
+@@ -32,15 +32,11 @@
+ #include <asm/unaligned.h>
+ #include "quest3-scm.h"
+ #include "quest3-platform.h"
++#include "quest3-layout.h"
+ #include <linux/platform_device.h>
+ #include <linux/spi/spi.h>
+ 
+ extern void qkx_flush_dcache_area(void *addr, size_t len);
+-#define QKX_LO 0x90000000ULL
+-#define QKX_HI 0x93400000ULL
+-#define QKX_ENTRY 0x90080000ULL
+-#define QKX_INITRD 0x93000000ULL
+-#define QKX_DTB 0x93200000ULL
+ /* Includes held allocations that land inside the destination window. */
+ #define QKX_MAX_PAGES 32768
+ #define QKX_DESC_COUNT ((PAGE_SIZE - 16) / 16)
+@@ -191,6 +187,7 @@
+ static struct qkx_desc *first_desc, *last_desc;
+ static void *code_page, *pgd_page;
+ static bool ram_found;
++static u64 image_entry;
+ static atomic_t *qkx_pm_abort_suspend;
+ static atomic_t qkx_suppress_wakeup_abort = ATOMIC_INIT(0);
+ 
+@@ -841,7 +838,7 @@
+ 		qkx_flush_dcache_area(page_address(owned[i]), PAGE_SIZE);
+ 	__flush_icache_range((unsigned long)code_page, (unsigned long)code_page + PAGE_SIZE);
+ 	qkx_enter(virt_to_phys(pgd_page), virt_to_phys(code_page),
+-		virt_to_phys(first_desc), QKX_ENTRY, QKX_DTB);
++		virt_to_phys(first_desc), image_entry, QKX_DTB);
+ 	panic("quest_kexec: trampoline returned after irreversible shutdown");
+ release_devices:
+ 	ret = qkx_platform_abort(&usb, &wdt, ret);
+@@ -958,7 +955,9 @@
+ 		QKX_LO, QKX_HI - 1, NULL, qkx_ram_cb);
+ 	if (ret || !ram_found)
+ 		return -ERANGE;
+-	/* Host prepare_boot.py also rejects nested reserved iomem regions. */
++	/* This parent-RAM walk does not reject nested reservations. The offline
++	 * layout check must also pass against the matching device's iomem and DT.
++	 */
+ 	owned = vzalloc(QKX_MAX_PAGES * sizeof(*owned));
+ 	if (!owned)
+ 		return -ENOMEM;
+@@ -980,9 +979,11 @@
+ 	image_size = get_unaligned_le64(kh + 16);
+ 	flags = get_unaligned_le64(kh + 24);
+ 	ret = -EINVAL;
+-	if (memcmp(kh + 56, "ARM\x64", 4) || get_unaligned_le64(kh + 8) != SZ_512K ||
+-	    image_size < ksize || image_size > QKX_INITRD - QKX_ENTRY ||
+-	    (flags & 1) || !(flags & 8) || ((flags & 6) != 0 && (flags & 6) != 2))
++	if (memcmp(kh + 56, "ARM\x64", 4))
++		goto out;
++	ret = qkx_image_layout(get_unaligned_le64(kh + 8), image_size,
++			       ksize, flags, &image_entry);
++	if (ret)
+ 		goto out;
+ 	pos = 0;
+ 	ret = qkx_read(df, dh, sizeof(dh), &pos);
+@@ -991,7 +992,7 @@
+ 	ret = -EINVAL;
+ 	if (get_unaligned_be32(dh) != 0xd00dfeed || get_unaligned_be32(dh + 4) != dsize)
+ 		goto out;
+-	ret = qkx_stage(kf, QKX_ENTRY, ksize, PAGE_ALIGN(image_size));
++	ret = qkx_stage(kf, image_entry, ksize, PAGE_ALIGN(image_size));
+ 	if (!ret)
+ 		ret = qkx_stage(rf, QKX_INITRD, rsize, PAGE_ALIGN(rsize));
+ 	if (!ret)
+@@ -1004,7 +1005,7 @@
+ 	if (df) filp_close(df, NULL);
+ 	if (!ret) {
+ 		pr_info("quest_kexec: staged %u copy pages, %u allocations; entry=%llx dtb=%llx; execute=%u\n",
+-			nr_copies, nr_owned, QKX_ENTRY, QKX_DTB, execute);
++			nr_copies, nr_owned, image_entry, QKX_DTB, execute);
+ 		if (test_transition)
+ 			ret = qkx_test_transition();
+ 		if (test_full_copy)
+--- /dev/null
++++ b/module/quest3-layout.h
+@@ -0,0 +1,25 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#ifndef QKX_QUEST3_LAYOUT_H
++#define QKX_QUEST3_LAYOUT_H
++
++#define QKX_LO 0x90000000ULL
++#define QKX_HI 0x93400000ULL
++#define QKX_INITRD 0x93000000ULL
++#define QKX_DTB 0x93200000ULL
++
++/* Board-specific supported offsets, from an aligned ARM64 boot base.
++ * Bounds are checked before addition or page rounding. This does not reserve
++ * destination RAM in the running kernel or authorize the final transition.
++ */
++static inline int qkx_image_layout(u64 offset, u64 size, u64 file_size,
++				   u64 flags, u64 *entry)
++{
++	if ((offset != 0 && offset != 0x80000) || file_size < 64 ||
++	    size < file_size || size > QKX_INITRD - QKX_LO - offset ||
++	    (flags & 1) || !(flags & 8) ||
++	    ((flags & 6) != 0 && (flags & 6) != 2))
++		return -EINVAL;
++	*entry = QKX_LO + offset;
++	return 0;
++}
++#endif

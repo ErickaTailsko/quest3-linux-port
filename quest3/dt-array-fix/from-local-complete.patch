@@ -1,0 +1,70 @@
+--- a/module/quest3-scm.c
++++ b/module/quest3-scm.c
+@@ -11,6 +11,56 @@
+ 	u32 original;
+ 	bool changed;
+ };
++
++/* Older firmware describes a flat register list, without CPU phandles.
++ * Report list entries rather than inventing a logical-CPU mapping. The DT
++ * establishes addresses, not the writable bit semantics of that driver.
++ */
++static int qkx_core_hang_array_report(struct device_node *node, unsigned int mode)
++{
++	u32 *addresses, threshold, value;
++	int count, i, j, ret;
++
++	if (mode != 1) {
++		pr_err("quest_kexec: core-hang config-arr schema is read-only; write ABI not verified\n");
++		return -EOPNOTSUPP;
++	}
++	count = of_property_count_u32_elems(node, "qcom,config-arr");
++	if (count <= 0 || count > nr_cpu_ids || count != num_possible_cpus() ||
++	    of_property_count_u32_elems(node, "qcom,threshold-arr") != count)
++		return -EINVAL;
++	addresses = kcalloc(count, sizeof(*addresses), GFP_KERNEL);
++	if (!addresses)
++		return -ENOMEM;
++	/* Validate the complete list before the first SCM read. */
++	for (i = 0; i < count; i++) {
++		ret = of_property_read_u32_index(node, "qcom,config-arr", i, &addresses[i]);
++		if (ret)
++			goto out;
++		ret = of_property_read_u32_index(node, "qcom,threshold-arr", i, &threshold);
++		if (ret)
++			goto out;
++		ret = -EINVAL;
++		if (!addresses[i] || (addresses[i] & 3) || !threshold || (threshold & 3))
++			goto out;
++		for (j = 0; j < i; j++)
++			if (addresses[j] == addresses[i])
++				goto out;
++	}
++	for (i = 0; i < count; i++) {
++		phys_addr_t address = addresses[i];
++
++		ret = qcom_scm_io_readl(address, &value);
++		if (ret)
++			goto out;
++		pr_info("quest_kexec: core-hang DT entry%d config=%pa value=%08x (read-only)\n",
++			i, &address, value);
++	}
++	ret = 0;
++out:
++	kfree(addresses);
++	return ret;
++}
+ 
+ int qkx_core_hang_configure(unsigned int mode)
+ {
+@@ -31,6 +81,10 @@
+ 		return -ENODEV;
+ 	if (!of_device_is_available(node))
+ 		goto out_node;
++	if (!of_find_property(node, "qcom,chd-percpu-info", NULL)) {
++		ret = qkx_core_hang_array_report(node, mode);
++		goto out_node;
++	}
+ 	cells = of_property_count_u32_elems(node, "qcom,chd-percpu-info");
+ 	ret = -EINVAL;
+ 	if (cells <= 0 || cells % 3)

@@ -1,0 +1,206 @@
+--- a/module/loader.c
++++ b/module/loader.c
+@@ -637,12 +637,11 @@
+ 	int (*freeze_users)(void) = (void *)lookup("freeze_processes");
+ 	void (*thaw_users)(void) = (void *)lookup("thaw_processes");
+ 	bool *events_check_enabled = (void *)lookup("events_check_enabled");
+-	int (*gpu_suspend)(struct device *) = (void *)lookup("adreno_pm_suspend");
+-	int (*gpu_resume)(struct device *) = (void *)lookup("adreno_pm_resume");
+ 	struct device *gpu, *watchdog, *usb_core = NULL, *rpmh_dev = NULL;
+ 	struct device *syncboss = NULL, *qmp_dev = NULL;
+ 	struct task_struct *wakeup_suppressor = NULL;
+-	bool syncboss_suspended = false, gpu_suspended = false;
++	bool syncboss_suspended = false;
++	struct qkx_gpu gpu_state = { };
+ 	bool users_frozen = false, old_events_check = false;
+ 	struct qkx_usb usb = { };
+ 	struct qkx_watchdog wdt = { };
+@@ -657,7 +656,7 @@
+ 		 kexec_progress ? "available" : "compiled out");
+ 	qkx_pm_abort_suspend = (void *)lookup("pm_abort_suspend");
+ 	if (!freeze_users || !thaw_users ||
+-	    !events_check_enabled || !qkx_pm_abort_suspend || !gpu_suspend || !gpu_resume)
++	    !events_check_enabled || !qkx_pm_abort_suspend)
+ 		return -ENOENT;
+ 	/* No EL2 recovery/HVC assumptions: this implementation supports EL1 boot. */
+ 	if (read_sysreg(CurrentEL) != 4 || mode[0] != 0xe11 || mode[1] != 0xe11)
+@@ -689,6 +688,9 @@
+ 		ret = -ENODEV;
+ 		goto release_devices;
+ 	}
++	ret = qkx_gpu_get(&gpu_state, gpu);
++	if (ret)
++		goto release_devices;
+ 	ret = qkx_usb_get(&usb, usb_core);
+ 	if (ret)
+ 		goto release_devices;
+@@ -736,9 +738,8 @@
+ 		goto release_devices;
+ 	}
+ 	users_frozen = true;
+-	gpu_suspended = true; /* Restore even if suspend partially fails. */
+ 	qkx_phase(9, "calling GPU suspend", false);
+-	ret = gpu_suspend(gpu);
++	ret = qkx_gpu_suspend(&gpu_state);
+ 	pr_emerg("quest_kexec: PHASE 10: GPU suspend returned %d\n", ret);
+ 	if (ret)
+ 		goto release_devices;
+@@ -852,8 +853,7 @@
+ 			err = syncboss->driver->pm->resume(syncboss);
+ 		ret = qkx_restore_error(ret, err, "syncboss");
+ 	}
+-	if (gpu_suspended)
+-		ret = qkx_restore_error(ret, gpu_resume(gpu), "GPU");
++	ret = qkx_restore_error(ret, qkx_gpu_put(&gpu_state, true), "GPU");
+ 	if (users_frozen)
+ 		thaw_users();
+ 	if (wakeup_suppressor) {
+--- a/module/quest3-platform.c
++++ b/module/quest3-platform.c
+@@ -293,14 +293,98 @@
+ 	return qkx_restore_error(error, qkx_usb_put(usb, true), "USB");
+ }
+ 
++/* The matching adreno driver publishes these exact callbacks in dev_pm_ops.
++ * No KGSL private layout, symbol lookup or function-pointer cast is needed.
++ */
++static bool qkx_gpu_valid(struct qkx_gpu *gpu)
++{
++	return gpu->dev->driver == gpu->driver &&
++		gpu->driver->pm == gpu->pm &&
++		dev_get_drvdata(gpu->dev) == gpu->data;
++}
++
++int qkx_gpu_get(struct qkx_gpu *gpu, struct device *dev)
++{
++	int ret = -ENODEV;
++
++	if (!dev)
++		return ret;
++	device_lock(dev);
++	if (!dev->driver || strcmp(dev->driver->name, "kgsl-3d") ||
++	    !dev_get_drvdata(dev))
++		goto out;
++	ret = -EOPNOTSUPP;
++	if (!dev->driver->pm || !dev->driver->pm->suspend ||
++	    !dev->driver->pm->resume)
++		goto out;
++	/* This adapter is for the matching KGSL system-sleep implementation.
++	 * A driver with runtime callbacks needs separate PM coordination.
++	 */
++	if (dev->driver->pm->runtime_suspend || dev->driver->pm->runtime_resume)
++		goto out;
++	ret = -ENODEV;
++	if (!try_module_get(dev->driver->owner))
++		goto out;
++	gpu->dev = get_device(dev);
++	gpu->driver = dev->driver;
++	gpu->pm = dev->driver->pm;
++	gpu->owner = dev->driver->owner;
++	gpu->data = dev_get_drvdata(dev);
++	ret = 0;
++out:
++	device_unlock(dev);
++	return ret;
++}
++
++/* Caller must freeze userspace and hold the system-sleep lock, as qkx_execute
++ * does. The device lock protects binding/drvdata across the typed callback.
++ */
++int qkx_gpu_suspend(struct qkx_gpu *gpu)
++{
++	int ret = -ENODEV;
++
++	if (!gpu->dev)
++		return ret;
++	device_lock(gpu->dev);
++	if (!qkx_gpu_valid(gpu))
++		goto out;
++	ret = -EBUSY;
++	if (gpu->attempted || gpu->dev->power.is_suspended)
++		goto out;
++	/* Like the previous implementation, try resume on a partial failure. */
++	gpu->attempted = true;
++	ret = gpu->pm->suspend(gpu->dev);
++out:
++	device_unlock(gpu->dev);
++	return ret;
++}
++
++int qkx_gpu_put(struct qkx_gpu *gpu, bool rollback)
++{
++	int ret = 0;
++
++	if (!gpu->dev)
++		return 0;
++	if (rollback && gpu->attempted) {
++		device_lock(gpu->dev);
++		ret = qkx_gpu_valid(gpu) ? gpu->pm->resume(gpu->dev) : -ENODEV;
++		device_unlock(gpu->dev);
++	}
++	put_device(gpu->dev);
++	module_put(gpu->owner);
++	memset(gpu, 0, sizeof(*gpu));
++	return ret;
++}
++
+ /* Deliberately no disconnect, watchdog callback, timer or SCM command here.
+  * This checks only the running board's bindings and required operations.
+  */
+ int qkx_platform_preflight(void)
+ {
+-	struct device *usb_dev, *wdt_dev;
++	struct device *usb_dev, *wdt_dev, *gpu_dev;
+ 	struct qkx_usb usb = { };
+ 	struct qkx_watchdog wdt = { };
++	struct qkx_gpu gpu = { };
+ 	int ret;
+ 
+ 	if (!qcom_scm_is_available()) {
+@@ -310,6 +394,12 @@
+ 	usb_dev = bus_find_device_by_name(&platform_bus_type, NULL, "a600000.dwc3");
+ 	wdt_dev = bus_find_device_by_name(&platform_bus_type, NULL,
+ 					"hypervisor:qcom,gh-watchdog");
++	gpu_dev = bus_find_device_by_name(&platform_bus_type, NULL, "3d00000.qcom,kgsl-3d0");
++	ret = qkx_gpu_get(&gpu, gpu_dev);
++	if (ret) {
++		pr_err("quest_kexec: preflight: KGSL PM operations unavailable: %d\n", ret);
++		goto out;
++	}
+ 	ret = qkx_usb_get(&usb, usb_dev);
+ 	if (ret) {
+ 		pr_err("quest_kexec: preflight: USB binding/operations unavailable: %d\n", ret);
+@@ -319,10 +409,12 @@
+ 	if (ret)
+ 		pr_err("quest_kexec: preflight: active Gunyah watchdog unavailable: %d\n", ret);
+ 	else
+-		pr_info("quest_kexec: read-only platform preflight passed; USB/watchdog bindings and SCM driver ready; firmware commands and kexec NOT tested\n");
++		pr_info("quest_kexec: read-only platform preflight passed; GPU/USB/watchdog bindings and SCM driver ready; firmware commands and kexec NOT tested\n");
+ out:
+ 	ret = qkx_restore_error(ret, qkx_watchdog_put(&wdt, false), "preflight watchdog references");
+ 	ret = qkx_restore_error(ret, qkx_usb_put(&usb, false), "preflight USB references");
++	ret = qkx_restore_error(ret, qkx_gpu_put(&gpu, false), "preflight GPU references");
++	put_device(gpu_dev);
+ 	put_device(wdt_dev);
+ 	put_device(usb_dev);
+ 	return ret;
+--- a/module/quest3-platform.h
++++ b/module/quest3-platform.h
+@@ -13,6 +13,17 @@
+ 	bool was_connected;
+ 	bool attempted;
+ };
++struct qkx_gpu {
++	struct device *dev;
++	struct device_driver *driver;
++	const struct dev_pm_ops *pm;
++	struct module *owner;
++	void *data;
++	bool attempted;
++};
++int qkx_gpu_get(struct qkx_gpu *gpu, struct device *dev);
++int qkx_gpu_suspend(struct qkx_gpu *gpu);
++int qkx_gpu_put(struct qkx_gpu *gpu, bool rollback);
+ struct qkx_watchdog {
+ 	struct device *dev;
+ 	struct device_driver *driver;

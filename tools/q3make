@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+set -euo pipefail
+repo=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+work=${Q3_WORK_ROOT:-"$repo/.work"}
+kernel=${Q3_KERNEL:-"$work/kernel"}
+out=${Q3_OUT:-"$work/out"}
+llvm=${Q3_LLVM:-"$work/clang-prebuilts/clang-r450784e/bin"}
+pahole=${Q3_PAHOLE:-"$work/pahole-build/pahole"}
+for tool in "$llvm/clang" "$llvm/ld.lld" "$pahole"; do
+    test -x "$tool" || { echo "Executável ausente: $tool" >&2; exit 1; }
+done
+exec env PATH="$llvm:$PATH" make -C "$kernel" O="$out" \
+    ARCH=arm64 LLVM=1 LLVM_IAS=1 \
+    CROSS_COMPILE=aarch64-linux-gnu- CLANG_TRIPLE=aarch64-linux-gnu- \
+    CC="$llvm/clang" LD="$llvm/ld.lld" AR="$llvm/llvm-ar" NM="$llvm/llvm-nm" \
+    OBJCOPY="$llvm/llvm-objcopy" OBJDUMP="$llvm/llvm-objdump" \
+    READELF="$llvm/llvm-readelf" STRIP="$llvm/llvm-strip" \
+    HOSTCC="$llvm/clang" HOSTCXX="$llvm/clang++" PAHOLE="$pahole" \
+    LOCALVERSION="${Q3_LOCALVERSION:--gd7102a837402}" "$@"

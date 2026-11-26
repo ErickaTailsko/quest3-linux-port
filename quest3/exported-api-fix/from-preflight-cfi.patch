@@ -1,0 +1,146 @@
+--- a/module/loader.c
++++ b/module/loader.c
+@@ -21,6 +21,8 @@
+ #include <linux/module.h>
+ #include <linux/of.h>
+ #include <linux/sched.h>
++#include <linux/suspend.h>
++#include <soc/qcom/rpmh.h>
+ #include <linux/slab.h>
+ #include <linux/vmalloc.h>
+ #include <asm/cacheflush.h>
+@@ -362,18 +364,16 @@
+ 	void (*restore)(void) = (void *)lookup("enable_nonboot_cpus");
+ 	int (*down)(unsigned int) = (void *)lookup("cpu_down");
+ 	int (*up)(unsigned int) = (void *)lookup("cpu_up");
+-	int (*affinity)(struct task_struct *, const struct cpumask *) =
+-		(void *)lookup("set_cpus_allowed_ptr");
+ 	cpumask_t saved, online, removed;
+-	int ret, affinity_ret, cpu;
+-	if (!freeze || !restore || !affinity || !down || !up)
++	int ret = 0, affinity_ret, cpu;
++	if (!freeze || !restore || !down || !up)
+ 		return -ENOENT;
+ 	cpumask_copy(&saved, &current->cpus_mask);
+ 	cpumask_copy(&online, cpu_online_mask);
+ 	cpumask_clear(&removed);
+ 	if (!cpu_online(0))
+ 		return -ENODEV;
+-	ret = affinity(current, cpumask_of(0));
++	ret = set_cpus_allowed_ptr(current, cpumask_of(0));
+ 	if (ret)
+ 		return ret;
+ 	pr_info("quest_kexec: reversible CPU offline test begins; online=%u\n",
+@@ -406,16 +406,15 @@
+ 		for_each_cpu(cpu, &removed) {
+ 			int up_ret = up(cpu);
+ 			pr_info("quest_kexec: cpu_up(%d)=%d\n", cpu, up_ret);
+-			if (up_ret)
+-				ret = up_ret;
++			ret = qkx_restore_error(ret, up_ret, "CPU online");
+ 		}
+ 	}
+ 	if (!cpumask_equal(&online, cpu_online_mask))
+-		ret = -EIO;
+-	affinity_ret = affinity(current, &saved);
++		ret = qkx_restore_error(ret, -EIO, "CPU online mask");
++	affinity_ret = set_cpus_allowed_ptr(current, &saved);
+ 	pr_info("quest_kexec: CPU restoration complete; online=%u affinity=%d result=%d\n",
+ 		num_online_cpus(), affinity_ret, ret);
+-	return ret ? ret : affinity_ret;
++	return qkx_restore_error(ret, affinity_ret, "CPU affinity");
+ }
+ 
+ static int qkx_test_full_copy(void)
+@@ -631,20 +630,15 @@
+ {
+ 	void (*prepare)(char *) = (void *)lookup("kernel_restart_prepare");
+ 	void (*migrate)(void) = (void *)lookup("migrate_to_reboot_cpu");
+-	void (*hotplug_enable)(void) = (void *)lookup("cpu_hotplug_enable");
+ 	void (*shutdown_cpus)(void) = (void *)lookup("machine_shutdown");
+ 	bool *kexec_progress = (void *)lookup("kexec_in_progress");
+ 	bool (*stuck)(void) = (void *)lookup("cpus_are_stuck_in_kernel");
+ 	const u32 *mode = (void *)lookup("__boot_cpu_mode");
+ 	int (*freeze_users)(void) = (void *)lookup("freeze_processes");
+ 	void (*thaw_users)(void) = (void *)lookup("thaw_processes");
+-	void (*sleep_lock)(void) = (void *)lookup("lock_system_sleep");
+-	void (*sleep_unlock)(void) = (void *)lookup("unlock_system_sleep");
+ 	bool *events_check_enabled = (void *)lookup("events_check_enabled");
+ 	int (*gpu_suspend)(struct device *) = (void *)lookup("adreno_pm_suspend");
+ 	int (*gpu_resume)(struct device *) = (void *)lookup("adreno_pm_resume");
+-	int (*rpmh_flush_fn)(const struct device *) =
+-		(void *)lookup("rpmh_write_sleep_and_wake");
+ 	struct device *gpu, *watchdog, *usb_core = NULL, *rpmh_dev = NULL;
+ 	struct device *syncboss = NULL, *qmp_dev = NULL;
+ 	struct task_struct *wakeup_suppressor = NULL;
+@@ -656,13 +650,13 @@
+ 	unsigned int i;
+ 	int ret;
+ 	qkx_phase(1, "symbol lookups returned", true);
+-	if (!prepare || !migrate || !hotplug_enable || !shutdown_cpus ||
++	if (!prepare || !migrate || !shutdown_cpus ||
+ 	    !stuck || !mode)
+ 		return -ENOENT;
+ 	pr_emerg("quest_kexec: native shutdown symbols ready; kexec_in_progress=%s\n",
+ 		 kexec_progress ? "available" : "compiled out");
+ 	qkx_pm_abort_suspend = (void *)lookup("pm_abort_suspend");
+-	if (!freeze_users || !thaw_users || !sleep_lock || !sleep_unlock ||
++	if (!freeze_users || !thaw_users ||
+ 	    !events_check_enabled || !qkx_pm_abort_suspend || !gpu_suspend || !gpu_resume)
+ 		return -ENOENT;
+ 	/* No EL2 recovery/HVC assumptions: this implementation supports EL1 boot. */
+@@ -682,11 +676,10 @@
+ 	if (flush_rpmh)
+ 		rpmh_dev = bus_find_device_by_name(&platform_bus_type, NULL,
+ 			"17a00000.rsc:rpmh-regulator-cxlvl");
+-	if (flush_rpmh && (!rpmh_flush_fn || !rpmh_dev)) {
+-		pr_emerg("quest_kexec: flush_rpmh requested but symbol=%d dev=%d; disabling\n",
+-			 !!rpmh_flush_fn, !!rpmh_dev);
+-		put_device(rpmh_dev);
+-		rpmh_dev = NULL;
++	if (flush_rpmh && !rpmh_dev) {
++		pr_err("quest_kexec: requested RPMh device unavailable\n");
++		ret = -ENODEV;
++		goto release_devices;
+ 	}
+ 	if (!gpu || !watchdog || !usb_core || !dev_get_drvdata(usb_core) ||
+ 	    (disconnect_qmp && (!qmp_dev || !dev_get_drvdata(qmp_dev))) ||
+@@ -709,7 +702,7 @@
+ 		goto release_devices;
+ 	}
+ 	qkx_phase(7, "acquiring system-sleep lock before freezing userspace", false);
+-	sleep_lock();
++	lock_system_sleep();
+ 	sleep_locked = true;
+ 	/* This is an irreversible reboot, not suspend. Android autosleep can arm
+ 	 * wakeup checking before blocking on system_transition_mutex, leaving a
+@@ -791,7 +784,7 @@
+ 	migrate();
+ 	/* migrate_to_reboot_cpu() disables hotplug; native kernel_kexec()
+ 	 * reenables it immediately before machine_shutdown(). */
+-	hotplug_enable();
++	cpu_hotplug_enable();
+ 	/* freeze_secondary_cpus() rechecks pm_wakeup_pending() per CPU; a late
+ 	 * wake IRQ during device shutdown would abort it and force a panic. */
+ 	WRITE_ONCE(*events_check_enabled, false);
+@@ -815,8 +808,10 @@
+ 		 * runs. rpmh_flush() is a no-op if nothing is dirty.
+ 		 */
+ 		qkx_phase(140, "flushing RPMh votes to RSC before final jump", false);
+-		rpmh_ret = rpmh_flush_fn(rpmh_dev);
++		rpmh_ret = rpmh_write_sleep_and_wake(rpmh_dev);
+ 		pr_emerg("quest_kexec: rpmh_flush returned %d\n", rpmh_ret);
++		if (rpmh_ret)
++			panic("quest_kexec: RPMh flush failed after irreversible shutdown (%d)", rpmh_ret);
+ 		qkx_phase(141, "rpmh_flush returned", false);
+ 		put_device(rpmh_dev);
+ 		rpmh_dev = NULL;
+@@ -868,7 +863,7 @@
+ 	}
+ 	if (sleep_locked) {
+ 		WRITE_ONCE(*events_check_enabled, old_events_check);
+-		sleep_unlock();
++		unlock_system_sleep();
+ 	}
+ 	put_device(gpu);
+ 	put_device(watchdog);

@@ -1,0 +1,99 @@
+--- a/module/quest3-platform.h
++++ b/module/quest3-platform.h
+@@ -34,4 +34,5 @@
+ int qkx_watchdog_put(struct qkx_watchdog *wdt, bool rollback);
+ int qkx_restore_error(int primary, int cleanup, const char *operation);
+ int qkx_platform_abort(struct qkx_usb *usb, struct qkx_watchdog *wdt, int error);
++int qkx_platform_preflight(void);
+ #endif
+--- a/module/quest3-platform.c
++++ b/module/quest3-platform.c
+@@ -1,6 +1,8 @@
+ // SPDX-License-Identifier: GPL-2.0
+ #include <linux/err.h>
+ #include <linux/of.h>
++#include <linux/platform_device.h>
++#include <linux/qcom_scm.h>
+ #include <linux/sched/clock.h>
+ #include "core.h"
+ #include "quest3-platform.h"
+@@ -290,3 +292,38 @@
+ 	error = qkx_restore_error(error, qkx_watchdog_put(wdt, true), "watchdog");
+ 	return qkx_restore_error(error, qkx_usb_put(usb, true), "USB");
+ }
++
++/* Deliberately no disconnect, watchdog callback, timer or SCM command here.
++ * This checks only the running board's bindings and required operations.
++ */
++int qkx_platform_preflight(void)
++{
++	struct device *usb_dev, *wdt_dev;
++	struct qkx_usb usb = { };
++	struct qkx_watchdog wdt = { };
++	int ret;
++
++	if (!qcom_scm_is_available()) {
++		pr_err("quest_kexec: preflight: SCM driver unavailable\n");
++		return -ENODEV;
++	}
++	usb_dev = bus_find_device_by_name(&platform_bus_type, NULL, "a600000.dwc3");
++	wdt_dev = bus_find_device_by_name(&platform_bus_type, NULL,
++					"hypervisor:qcom,gh-watchdog");
++	ret = qkx_usb_get(&usb, usb_dev);
++	if (ret) {
++		pr_err("quest_kexec: preflight: USB binding/operations unavailable: %d\n", ret);
++		goto out;
++	}
++	ret = qkx_watchdog_get(&wdt, wdt_dev, false, false);
++	if (ret)
++		pr_err("quest_kexec: preflight: active Gunyah watchdog unavailable: %d\n", ret);
++	else
++		pr_info("quest_kexec: read-only platform preflight passed; USB/watchdog bindings and SCM driver ready; firmware commands and kexec NOT tested\n");
++out:
++	ret = qkx_restore_error(ret, qkx_watchdog_put(&wdt, false), "preflight watchdog references");
++	ret = qkx_restore_error(ret, qkx_usb_put(&usb, false), "preflight USB references");
++	put_device(wdt_dev);
++	put_device(usb_dev);
++	return ret;
++}
+--- a/module/loader.c
++++ b/module/loader.c
+@@ -95,7 +95,7 @@
+ MODULE_PARM_DESC(core_hang_control, "0: untouched; 1: report secure core-hang registers; 2: clear enable bit");
+ MODULE_PARM_DESC(secure_watchdog_control, "0: untouched; 1: report SCM driver readiness only; 2: qcom_scm_sec_wdog_deactivate");
+ MODULE_PARM_DESC(phase_delay_ms, "Pause at pre-freeze checkpoints, maximum 5000 ms");
+-MODULE_PARM_DESC(preflight_only, "1: preflight; 2: GPU rehearsal; 3: combined CPU/physical rehearsal");
++MODULE_PARM_DESC(preflight_only, "1: standalone read-only platform checks (execute=0); 2: GPU rehearsal; 3: combined CPU/physical rehearsal");
+ MODULE_PARM_DESC(preserve_watchdog, "Retain apps WDT during preparation; skip implicit secure disable; recovery keeps apps WDT armed");
+ MODULE_PARM_DESC(watchdog_recovery, "Keep apps WDT armed for an automatic diagnostic reset instead of quiescing it");
+ MODULE_PARM_DESC(watchdog_control, "Unsupported: timing changes cannot restore the original bite timeout");
+@@ -212,7 +212,7 @@
+ 
+ 	/* A kprobe address is not a typed CFI call target. Fail before probing. */
+ 	if (IS_ENABLED(CONFIG_CFI_CLANG)) {
+-		pr_err("quest_kexec: CFI blocks private-symbol paths: execute (including preflight), test_cpus, warm_reset_test; exported-API port required\n");
++		pr_err("quest_kexec: CFI blocks private-symbol paths: execute (including rehearsals 2/3), test_cpus, warm_reset_test; exported-API port required\n");
+ 		return -EOPNOTSUPP;
+ 	}
+ 	ret = register_kprobe(&kp);
+@@ -886,6 +886,20 @@
+ 	u64 ksize, rsize, dsize, image_size, flags;
+ 	loff_t pos = 0;
+ 	int ret;
++	/* Standalone inspection: never stage, invoke SCM commands or resolve
++	 * private symbols. Reject mixed modes rather than ignoring flags.
++	 */
++	if (preflight_only == 1) {
++		if (execute || test_cpus || test_transition || test_full_copy ||
++		    warm_reset_test || core_hang_control || secure_watchdog_control ||
++		    preserve_watchdog || watchdog_recovery || watchdog_control ||
++		    post_shutdown_probe || flush_rpmh || suspend_syncboss ||
++		    disconnect_qmp || phase_delay_ms)
++			return -EINVAL;
++		if (!of_machine_is_compatible("qcom,anorak"))
++			return -ENODEV;
++		return qkx_platform_preflight();
++	}
+ 	if (test_cpus > 2 || preflight_only > 3 || core_hang_control > 2 ||
+ 	    secure_watchdog_control > 2 || phase_delay_ms > 5000 ||
+ 	    (preflight_only && !execute) || (post_shutdown_probe && !execute) ||

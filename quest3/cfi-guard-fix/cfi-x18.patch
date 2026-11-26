@@ -1,0 +1,97 @@
+--- a/module/loader.c
++++ b/module/loader.c
+@@ -206,7 +206,14 @@
+ static int qkx_resolve(void)
+ {
+ 	struct kprobe kp = { .symbol_name = "kallsyms_lookup_name" };
+-	int ret = register_kprobe(&kp);
++	int ret;
++
++	/* A kprobe address is not a typed CFI call target. Fail before probing. */
++	if (IS_ENABLED(CONFIG_CFI_CLANG)) {
++		pr_err("quest_kexec: CFI blocks private-symbol paths: execute (including preflight), test_cpus, warm_reset_test, core_hang_control, secure_watchdog_control; exported-API port required\n");
++		return -EOPNOTSUPP;
++	}
++	ret = register_kprobe(&kp);
+ 	if (ret)
+ 		return ret;
+ 	lookup = (void *)kp.addr;
+@@ -1026,7 +1033,6 @@
+ 	u64 ksize, rsize, dsize, image_size, flags;
+ 	loff_t pos = 0;
+ 	int ret;
+-	int (*walk_ram)(u64, u64, void *, int (*)(struct resource *, void *));
+ 	if (test_cpus > 2 || preflight_only > 3 || core_hang_control > 2 ||
+ 	    secure_watchdog_control > 2 || phase_delay_ms > 5000 ||
+ 	    (preflight_only && !execute) || (post_shutdown_probe && !execute) ||
+@@ -1045,9 +1051,13 @@
+ #endif
+ 	if (!of_machine_is_compatible("qcom,anorak"))
+ 		return -ENODEV;
+-	ret = qkx_resolve();
+-	if (ret)
+-		return ret;
++	/* Reject all private-symbol modes before any hardware/state changes. */
++	if (execute || test_cpus || warm_reset_test || core_hang_control ||
++	    secure_watchdog_control) {
++		ret = qkx_resolve();
++		if (ret)
++			return ret;
++	}
+ 	if (warm_reset_test) {
+ 		bool *force_warm = (void *)lookup("force_warm_reboot");
+ 		void (*restart)(char *) = (void *)lookup("machine_restart");
+@@ -1070,10 +1080,10 @@
+ 		if (ret)
+ 			return ret;
+ 	}
+-	walk_ram = (void *)lookup("walk_system_ram_res");
+-	if (!walk_ram)
+-		return -ENOENT;
+-	ret = walk_ram(QKX_LO, QKX_HI - 1, NULL, qkx_ram_cb);
++	/* Same flags and traversal as walk_system_ram_res(), but exported. */
++	ret = walk_iomem_res_desc(IORES_DESC_NONE,
++		IORESOURCE_SYSTEM_RAM | IORESOURCE_BUSY,
++		QKX_LO, QKX_HI - 1, NULL, qkx_ram_cb);
+ 	if (ret || !ram_found)
+ 		return -ERANGE;
+ 	/* Host prepare_boot.py also rejects nested reserved iomem regions. */
+--- a/module/usb_log.c
++++ b/module/usb_log.c
+@@ -90,7 +90,14 @@
+ 		int (*)(struct device *, const void *));
+ 	void (*register_con)(struct console *);
+ 	struct mutex *udc_lock;
+-	int ret = register_kprobe(&kp);
++	int ret;
++
++	/* This resident hook depends on private UDC state and raw call targets. */
++	if (IS_ENABLED(CONFIG_CFI_CLANG)) {
++		pr_err("qkx_usb_log: CFI blocks private-symbol UDC hooks; exported-API port required\n");
++		return -EOPNOTSUPP;
++	}
++	ret = register_kprobe(&kp);
+ 	if (ret)
+ 		return ret;
+ 	lookup = (void *)kp.addr;
+--- a/module/transition.S
++++ b/module/transition.S
+@@ -108,7 +108,8 @@
+ 	stp x23, x24, [sp, #32]
+ 	stp x25, x26, [sp, #48]
+ 	stp x27, x28, [sp, #64]
+-	str x30, [sp, #80]
++	/* x18 is the kernel shadow-stack pointer, also used by relocation. */
++	stp x18, x30, [sp, #80]
+ 	mrs x24, tcr_el1
+ 	mrs x25, ttbr0_el1
+ 	mrs x26, sctlr_el1
+@@ -143,7 +144,7 @@
+ 	isb
+ 	msr tcr_el1, x24
+ 	isb
+-	ldr x30, [sp, #80]
++	ldp x18, x30, [sp, #80]
+ 	ldp x27, x28, [sp, #64]
+ 	ldp x25, x26, [sp, #48]
+ 	ldp x23, x24, [sp, #32]

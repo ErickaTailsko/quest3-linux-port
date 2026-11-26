@@ -1,0 +1,6 @@
+/build
+/config.h
+tests/bin/*
+!tests/bin/test_bin.c
+!tests/bin/Makefile
+tests/.test-times

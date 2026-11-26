@@ -1,0 +1,714 @@
+--- a/module/loader.c
++++ b/module/loader.c
+@@ -29,7 +29,9 @@
+ #include <asm/sysreg.h>
+ #include <asm/unaligned.h>
+ #include "quest3-scm.h"
+-#include "core.h" /* Matching kernel's drivers/usb/dwc3; no guessed offsets. */
++#include "quest3-platform.h"
++#include <linux/platform_device.h>
++#include <linux/spi/spi.h>
+ 
+ extern void qkx_flush_dcache_area(void *addr, size_t len);
+ #define QKX_LO 0x90000000ULL
+@@ -89,14 +91,14 @@
+ module_param(suspend_syncboss, bool, 0);
+ MODULE_PARM_DESC(suspend_syncboss, "Suspend spi0.0 syncboss through its PM callback before kexec, stopping active GPI DMA");
+ module_param(disconnect_qmp, bool, 0);
+-MODULE_PARM_DESC(disconnect_qmp, "Cleanly close Android AOP QMP channels and publish mcore LINK_DOWN before kexec");
++MODULE_PARM_DESC(disconnect_qmp, "Unsupported: QMP disconnect has no validated rollback");
+ MODULE_PARM_DESC(core_hang_control, "0: untouched; 1: report secure core-hang registers; 2: clear enable bit");
+ MODULE_PARM_DESC(secure_watchdog_control, "0: untouched; 1: report SCM driver readiness only; 2: qcom_scm_sec_wdog_deactivate");
+ MODULE_PARM_DESC(phase_delay_ms, "Pause at pre-freeze checkpoints, maximum 5000 ms");
+ MODULE_PARM_DESC(preflight_only, "1: preflight; 2: GPU rehearsal; 3: combined CPU/physical rehearsal");
+-MODULE_PARM_DESC(preserve_watchdog, "Hand watchdog to target: bypass rejected secure disable");
++MODULE_PARM_DESC(preserve_watchdog, "Retain apps WDT during preparation; skip implicit secure disable; recovery keeps apps WDT armed");
+ MODULE_PARM_DESC(watchdog_recovery, "Keep apps WDT armed for an automatic diagnostic reset instead of quiescing it");
+-MODULE_PARM_DESC(watchdog_control, "After shutdown, latch a 10-second watchdog and spin for host timing calibration");
++MODULE_PARM_DESC(watchdog_control, "Unsupported: timing changes cannot restore the original bite timeout");
+ MODULE_PARM_DESC(execute, "Experimental irreversible jump after staging (default false)");
+ 
+ extern void qkx_enter(u64 pgd, u64 code, u64 descriptors, u64 entry, u64 fdt) __noreturn;
+@@ -566,7 +568,7 @@
+ 		msleep(phase_delay_ms);
+ }
+ 
+-static int qkx_disconnect_aop_qmp(struct device *dev)
++static int __maybe_unused qkx_disconnect_aop_qmp(struct device *dev)
+ {
+ 	struct qkx_qmp_device *mdev = dev_get_drvdata(dev);
+ 	void (*shutdown)(struct mbox_chan *) = (void *)lookup("qmp_shutdown");
+@@ -641,21 +643,15 @@
+ 	bool *events_check_enabled = (void *)lookup("events_check_enabled");
+ 	int (*gpu_suspend)(struct device *) = (void *)lookup("adreno_pm_suspend");
+ 	int (*gpu_resume)(struct device *) = (void *)lookup("adreno_pm_resume");
+-	ssize_t (*watchdog_disable)(struct device *, struct device_attribute *,
+-		const char *, size_t) = (void *)lookup("qcom_wdt_disable_set.cfi_jt");
+-	struct bus_type *platform_bus = (void *)lookup("platform_bus_type");
+-	struct bus_type *spi_bus = (void *)lookup("spi_bus_type");
+-	struct device *(*find_dev)(struct bus_type *, struct device *, const char *) =
+-		(void *)lookup("bus_find_device_by_name");
+-	int (*suspend_dwc3_gadget)(void *) =
+-		(void *)lookup("dwc3_gadget_suspend");
+ 	int (*rpmh_flush_fn)(const struct device *) =
+ 		(void *)lookup("rpmh_write_sleep_and_wake");
+ 	struct device *gpu, *watchdog, *usb_core = NULL, *rpmh_dev = NULL;
+ 	struct device *syncboss = NULL, *qmp_dev = NULL;
+ 	struct task_struct *wakeup_suppressor = NULL;
+-	bool syncboss_suspended = false;
+-	void __iomem *wdt_regs = NULL;
++	bool syncboss_suspended = false, gpu_suspended = false;
++	bool users_frozen = false, old_events_check = false;
++	struct qkx_usb usb = { };
++	struct qkx_watchdog wdt = { };
+ 	bool sleep_locked = false;
+ 	unsigned int i;
+ 	int ret;
+@@ -667,9 +663,7 @@
+ 		 kexec_progress ? "available" : "compiled out");
+ 	qkx_pm_abort_suspend = (void *)lookup("pm_abort_suspend");
+ 	if (!freeze_users || !thaw_users || !sleep_lock || !sleep_unlock ||
+-	    !events_check_enabled || !qkx_pm_abort_suspend || !gpu_suspend || !gpu_resume ||
+-	    !watchdog_disable || !platform_bus || !find_dev ||
+-	    !suspend_dwc3_gadget || (suspend_syncboss && !spi_bus))
++	    !events_check_enabled || !qkx_pm_abort_suspend || !gpu_suspend || !gpu_resume)
+ 		return -ENOENT;
+ 	/* No EL2 recovery/HVC assumptions: this implementation supports EL1 boot. */
+ 	if (read_sysreg(CurrentEL) != 4 || mode[0] != 0xe11 || mode[1] != 0xe11)
+@@ -677,16 +671,16 @@
+ 	if (stuck())
+ 		return -EBUSY;
+ 	qkx_phase(2, "EL1 and CPU checks passed; looking up GPU", true);
+-	gpu = find_dev(platform_bus, NULL, "3d00000.qcom,kgsl-3d0");
++	gpu = bus_find_device_by_name(&platform_bus_type, NULL, "3d00000.qcom,kgsl-3d0");
+ 	qkx_phase(3, "GPU lookup returned; looking up watchdog", true);
+-	watchdog = find_dev(platform_bus, NULL, "hypervisor:qcom,gh-watchdog");
+-	usb_core = find_dev(platform_bus, NULL, "a600000.dwc3");
++	watchdog = bus_find_device_by_name(&platform_bus_type, NULL, "hypervisor:qcom,gh-watchdog");
++	usb_core = bus_find_device_by_name(&platform_bus_type, NULL, "a600000.dwc3");
+ 	if (suspend_syncboss)
+-		syncboss = find_dev(spi_bus, NULL, "spi0.0");
++		syncboss = bus_find_device_by_name(&spi_bus_type, NULL, "spi0.0");
+ 	if (disconnect_qmp)
+-		qmp_dev = find_dev(platform_bus, NULL, "c300000.qcom,qmp-aop");
++		qmp_dev = bus_find_device_by_name(&platform_bus_type, NULL, "c300000.qcom,qmp-aop");
+ 	if (flush_rpmh)
+-		rpmh_dev = find_dev(platform_bus, NULL,
++		rpmh_dev = bus_find_device_by_name(&platform_bus_type, NULL,
+ 			"17a00000.rsc:rpmh-regulator-cxlvl");
+ 	if (flush_rpmh && (!rpmh_flush_fn || !rpmh_dev)) {
+ 		pr_emerg("quest_kexec: flush_rpmh requested but symbol=%d dev=%d; disabling\n",
+@@ -697,30 +691,17 @@
+ 	if (!gpu || !watchdog || !usb_core || !dev_get_drvdata(usb_core) ||
+ 	    (disconnect_qmp && (!qmp_dev || !dev_get_drvdata(qmp_dev))) ||
+ 	    (suspend_syncboss && (!syncboss || !syncboss->driver ||
+-	     !syncboss->driver->pm || !syncboss->driver->pm->suspend))) {
+-		put_device(gpu);
+-		put_device(watchdog);
+-		put_device(usb_core);
+-		put_device(rpmh_dev);
+-		put_device(syncboss);
+-		put_device(qmp_dev);
+-		return -ENODEV;
+-	}
+-	qkx_phase(4, "devices found; mapping watchdog if requested", true);
+-	if (preserve_watchdog) {
+-		/* The exact seacliff device name above and captured DT identify this
+-		 * block. Only WDT0_RST is written; timeouts and enable are preserved.
+-		 */
+-		wdt_regs = NULL; /* Q3: no direct MMIO watchdog access */
+-		if (!wdt_regs) {
+-			ret = -ENOMEM;
+-			goto release_devices;
+-		}
+-		qkx_phase(5, "watchdog mapped; reading registers", true);
+-		pr_emerg("quest_kexec: preserving watchdog en=%x bark=%u bite=%u\n",
+-			readl_relaxed(wdt_regs + 0x08), readl_relaxed(wdt_regs + 0x10),
+-			readl_relaxed(wdt_regs + 0x14));
+-	}
++	     !syncboss->driver->pm || !syncboss->driver->pm->suspend ||
++	     !syncboss->driver->pm->resume))) {
++		ret = -ENODEV;
++		goto release_devices;
++	}
++	ret = qkx_usb_get(&usb, usb_core);
++	if (ret)
++		goto release_devices;
++	ret = qkx_watchdog_get(&wdt, watchdog, preserve_watchdog, watchdog_control);
++	if (ret)
++		goto release_devices;
+ 	qkx_phase(6, "preflight complete; next operation freezes userspace", true);
+ 	if (preflight_only == 1) {
+ 		pr_emerg("quest_kexec: preflight-only test complete; returning without shutdown\n");
+@@ -736,6 +717,7 @@
+ 	 * suspend-only abort check while holding the system-sleep lock;
+ 	 * freeze_processes still clears pm_abort_suspend itself.
+ 	 */
++	old_events_check = READ_ONCE(*events_check_enabled);
+ 	WRITE_ONCE(*events_check_enabled, false);
+ 	atomic_set(&qkx_suppress_wakeup_abort, 1);
+ 	wakeup_suppressor = kthread_run(qkx_wakeup_suppressor, NULL,
+@@ -760,91 +742,45 @@
+ 	if (ret) {
+ 		goto release_devices;
+ 	}
++	users_frozen = true;
++	gpu_suspended = true; /* Restore even if suspend partially fails. */
+ 	qkx_phase(9, "calling GPU suspend", false);
+ 	ret = gpu_suspend(gpu);
+ 	pr_emerg("quest_kexec: PHASE 10: GPU suspend returned %d\n", ret);
+-	if (ret) {
+-		gpu_resume(gpu);
+-		thaw_users();
++	if (ret)
+ 		goto release_devices;
+-	}
+ 	if (suspend_syncboss) {
+ 		qkx_phase(10, "suspending Android syncboss SPI streaming", false);
++		syncboss_suspended = true;
+ 		ret = syncboss->driver->pm->suspend(syncboss);
+ 		pr_emerg("quest_kexec: syncboss suspend returned %d\n", ret);
++		if (ret)
++			goto release_devices;
++	}
++	if (preflight_only >= 2) {
++		if (preflight_only == 3)
++			ret = qkx_test_cpus();
++		goto release_devices;
++	}
++	ret = qkx_usb_disconnect(&usb);
++	if (ret)
++		goto release_devices;
++	ret = qkx_watchdog_prepare(&wdt);
++	if (ret)
++		goto release_devices;
++	ret = qkx_watchdog_finish(&wdt, watchdog_recovery);
++	if (ret)
++		goto release_devices;
++	/* Last fallible step before irreversible shutdown. The secure watchdog
++	 * API has no inverse; never include it in the reversible preparation.
++	 */
++	if (!preserve_watchdog || secure_watchdog_control == 2) {
++		ret = qkx_secure_watchdog_configure(2);
+ 		if (ret) {
+-			gpu_resume(gpu);
+-			thaw_users();
++			pr_err("quest_kexec: secure watchdog disable failed; secure state cannot be restored by this API\n");
+ 			goto release_devices;
+ 		}
+-		syncboss_suspended = true;
+-	}
+-	if (preflight_only >= 2) {
+-		int resume_ret;
+-		if (preflight_only == 3)
+-			ret = qkx_test_cpus();
+-		resume_ret = gpu_resume(gpu);
+-		thaw_users();
+-		pr_emerg("quest_kexec: rehearsal restored userspace; GPU resume=%d test=%d\n",
+-			resume_ret, ret);
+-		if (!ret)
+-			ret = resume_ret;
+-		goto release_devices;
+-	}
+-	/* Stop gadget traffic and controller Run/Stop without tearing down the
+-	 * Qualcomm glue power domain. Full driver unbind hard-resets the board. */
+-	{
+-		struct dwc3 *dwc = dev_get_drvdata(usb_core);
+-		int in_lpm = 0; /* Q3: in_lpm is in struct dwc3_msm (a600000.ssusb), not struct dwc3 here. Dead code while preflight_only<=1. TODO before execute=1. */
+-
+-		pr_emerg("quest_kexec: DWC3 in_lpm=%d gadget_driver=%s\n",
+-			in_lpm, dwc->gadget_driver ? "bound" : "none");
+-		/* Qualcomm defines in_lpm as controller clocks off. The stock
+-		 * gadget suspend callback starts with unguarded MMIO, which can
+-		 * hang the CPU in charger-only/no-host operation. Already-low-power
+-		 * hardware needs no further gadget stop; preserve its power domain.
+-		 */
+-		if (in_lpm) {
+-			qkx_phase(10, "DWC3 already in low power; skipping gadget MMIO", false);
+-		} else {
+-			qkx_phase(10, "suspending Android DWC3 gadget", false);
+-			ret = suspend_dwc3_gadget(dwc);
+-			pr_emerg("quest_kexec: DWC3 gadget suspend returned %d\n", ret);
+-			if (ret)
+-				panic("quest_kexec: DWC3 gadget suspend failed (%d)", ret);
+-		}
+-	}
+-	put_device(usb_core);
+-	usb_core = NULL;
+-
+-	/* Invoke the driver's complete operation: secure SCM call, disable mutex,
+-	 * application watchdog, IRQ and timer teardown. No sysfs write is used.
+-	 */
+-	if (preserve_watchdog) {
+-		pr_emerg("quest_kexec: deferring apps-watchdog quiesce until final jump\n");
+-		ret = 1;
+-	} else {
+-		pr_emerg("quest_kexec: disabling secure and application watchdogs\n");
+-		ret = watchdog_disable(watchdog, NULL, "1", 1);
+-	}
+-	if (ret != 1) {
+-		if (ret >= 0)
+-			ret = -EIO;
+-		gpu_resume(gpu);
+-		thaw_users();
+-		goto release_devices;
+-	}
+-	if (disconnect_qmp) {
+-		qkx_phase(109, "cleanly disconnecting Android AOP QMP", false);
+-		ret = qkx_disconnect_aop_qmp(qmp_dev);
+-		pr_emerg("quest_kexec: AOP QMP disconnect returned %d\n", ret);
+-		if (ret)
+-			panic("quest_kexec: AOP QMP disconnect failed (%d)", ret);
+-	}
+-	put_device(qmp_dev);
+-	qmp_dev = NULL;
+-	put_device(gpu);
+-	put_device(watchdog);
++	}
+ 	/* Match kernel_kexec(): advertise kexec before device shutdown so PCI
+ 	 * and any other kexec-aware shutdown callbacks choose the right path. */
+ 	if (kexec_progress)
+@@ -897,40 +833,7 @@
+ 		memset(code_page, 0, PAGE_SIZE);
+ 		memcpy(code_page, qkx_reloc_start, qkx_reloc_end - qkx_reloc_start);
+ 	}
+-	if (wdt_regs) {
+-		if (watchdog_recovery) {
+-			/* Retain the normal 12/15-second watchdog for this diagnostic
+-			 * attempt so a warm reset preserves the early-entry RAM marker.
+-			 */
+-			writel_relaxed(1, wdt_regs + 0x04);
+-			mb();
+-			pr_emerg("quest_kexec: apps watchdog armed for diagnostic recovery; EN=%x\n",
+-				 readl_relaxed(wdt_regs + 0x08));
+-		} else {
+-			/* Stop the apps watchdog while normal mappings and USB diagnostics
+-			 * are still available. The target watchdog probe re-enables it.
+-			 */
+-			writel_relaxed(0, wdt_regs + 0x08);
+-			mb();
+-			pr_emerg("quest_kexec: apps watchdog quiesced; EN readback=%x\n",
+-				 readl_relaxed(wdt_regs + 0x08));
+-		}
+-	}
+ 	qkx_phase(15, "single CPU; flushing payload and entering physical trampoline", false);
+-	if (watchdog_control) {
+-		/* Second calibration point: exactly twice the first control's ticks. */
+-		writel_relaxed(0, wdt_regs + 0x08);
+-		mb();
+-		writel_relaxed(622535, wdt_regs + 0x10);
+-		writel_relaxed(655300, wdt_regs + 0x14);
+-		writel_relaxed(3, wdt_regs + 0x08);
+-		writel_relaxed(1, wdt_regs + 0x04);
+-		mb();
+-		pr_emerg("quest_kexec: watchdog timing control armed; spinning\n");
+-		local_irq_disable();
+-		for (;;)
+-			cpu_relax();
+-	}
+ 	/* Let the direct USB reader observe CPU7 completion and this checkpoint
+ 	 * before interrupts are masked. This is not an acknowledgment protocol.
+ 	 */
+@@ -943,19 +846,30 @@
+ 	__flush_icache_range((unsigned long)code_page, (unsigned long)code_page + PAGE_SIZE);
+ 	qkx_enter(virt_to_phys(pgd_page), virt_to_phys(code_page),
+ 		virt_to_phys(first_desc), QKX_ENTRY, QKX_DTB);
++	panic("quest_kexec: trampoline returned after irreversible shutdown");
+ release_devices:
+-	if (syncboss_suspended && syncboss && syncboss->driver &&
+-	    syncboss->driver->pm && syncboss->driver->pm->resume)
+-		syncboss->driver->pm->resume(syncboss);
++	ret = qkx_platform_abort(&usb, &wdt, ret);
++	if (syncboss_suspended) {
++		int err = -ENODEV;
++
++		if (syncboss && syncboss->driver && syncboss->driver->pm &&
++		    syncboss->driver->pm->resume)
++			err = syncboss->driver->pm->resume(syncboss);
++		ret = qkx_restore_error(ret, err, "syncboss");
++	}
++	if (gpu_suspended)
++		ret = qkx_restore_error(ret, gpu_resume(gpu), "GPU");
++	if (users_frozen)
++		thaw_users();
+ 	if (wakeup_suppressor) {
+ 		atomic_set(&qkx_suppress_wakeup_abort, 0);
+ 		kthread_stop(wakeup_suppressor);
+ 		atomic_set(qkx_pm_abort_suspend, 0);
+ 	}
+-	if (sleep_locked)
++	if (sleep_locked) {
++		WRITE_ONCE(*events_check_enabled, old_events_check);
+ 		sleep_unlock();
+-	if (wdt_regs)
+-		iounmap(wdt_regs);
++	}
+ 	put_device(gpu);
+ 	put_device(watchdog);
+ 	put_device(usb_core);
+@@ -982,6 +896,10 @@
+ 		return -EINVAL;
+ 	if (test_full_copy && (execute || test_transition || test_cpus))
+ 		return -EINVAL;
++	if (watchdog_control || disconnect_qmp) {
++		pr_err("quest_kexec: watchdog timing changes and QMP disconnect lack a reversible API; refusing\n");
++		return -EOPNOTSUPP;
++	}
+ #ifndef QKX_ENABLE_EXPERIMENTAL_JUMP
+ 	if (execute) {
+ 		pr_err("quest_kexec: jump disabled in this staging build; board shutdown is unvalidated\n");
+@@ -1013,7 +931,7 @@
+ 		if (ret)
+ 			return ret;
+ 	}
+-	if (secure_watchdog_control) {
++	if (secure_watchdog_control && !(execute && secure_watchdog_control == 2)) {
+ 		ret = qkx_secure_watchdog_configure(secure_watchdog_control);
+ 		if (ret)
+ 			return ret;
+--- a/module/Makefile
++++ b/module/Makefile
+@@ -7,7 +7,7 @@
+ ifneq ($(KERNELRELEASE),)
+ obj-m += quest_kexec.o marker_read.o
+ obj-m += usb_log.o
+-quest_kexec-y := loader.o transition.o quest3-scm.o
++quest_kexec-y := loader.o transition.o quest3-scm.o quest3-platform.o
+ # Without this define the module can only stage (execute=1 is refused).
+ ccflags-y += -DQKX_ENABLE_EXPERIMENTAL_JUMP
+ ccflags-y += -I$(srctree)/drivers/usb/dwc3
+--- /dev/null
++++ b/module/quest3-platform.c
+@@ -0,0 +1,292 @@
++// SPDX-License-Identifier: GPL-2.0
++#include <linux/err.h>
++#include <linux/of.h>
++#include <linux/sched/clock.h>
++#include "core.h"
++#include "quest3-platform.h"
++
++int qkx_restore_error(int primary, int cleanup, const char *operation)
++{
++	if (cleanup)
++		pr_err("quest_kexec: %s restoration failed: %d (primary=%d)\n",
++		       operation, cleanup, primary);
++	return primary ? primary : cleanup;
++}
++
++/* Call only with the controller device locked; a module reference alone does
++ * not prevent driver unbind. Never dereference saved drvdata after unbind.
++ */
++static bool qkx_usb_valid(struct qkx_usb *usb)
++{
++	struct dwc3 *dwc;
++
++	if (usb->dev->driver != usb->driver)
++		return false;
++	dwc = dev_get_drvdata(usb->dev);
++	return dwc && dwc->dev == usb->dev && dwc->gadget == usb->gadget;
++}
++
++int qkx_usb_get(struct qkx_usb *usb, struct device *dev)
++{
++	struct dwc3 *dwc;
++	int ret = -ENODEV;
++
++	if (!dev)
++		return -ENODEV;
++	device_lock(dev);
++	if (!dev->driver || strcmp(dev->driver->name, "dwc3"))
++		goto out;
++	dwc = dev_get_drvdata(dev);
++	if (!dwc || dwc->dev != dev || !dwc->gadget ||
++	    !dwc->gadget->ops || !dwc->gadget->ops->pullup)
++		goto out;
++	if (!try_module_get(dev->driver->owner))
++		goto out;
++	usb->owner = dev->driver->owner;
++	usb->driver = dev->driver;
++	usb->dev = get_device(dev);
++	usb->gadget = dwc->gadget;
++	get_device(&usb->gadget->dev);
++	ret = 0;
++out:
++	device_unlock(dev);
++	return ret;
++}
++
++int qkx_usb_disconnect(struct qkx_usb *usb)
++{
++	int ret = -ENODEV;
++
++	if (!usb->dev)
++		return ret;
++	device_lock(usb->dev);
++	if (!qkx_usb_valid(usb))
++		goto out;
++	ret = -EBUSY;
++	if (usb->attempted)
++		goto out;
++	usb->was_connected = usb->gadget->connected;
++	/* DWC3 sets softconnect before runtime-PM/RunStop can fail. Attempt
++	 * restoration even on failure, and leave an originally disconnected
++	 * gadget disconnected. Its pullup handles runtime-suspended hardware.
++	 */
++	usb->attempted = usb->was_connected;
++	ret = usb_gadget_disconnect(usb->gadget);
++out:
++	device_unlock(usb->dev);
++	return ret;
++}
++
++int qkx_usb_put(struct qkx_usb *usb, bool rollback)
++{
++	int ret = 0;
++
++	if (!usb->dev)
++		return 0;
++	if (rollback && usb->attempted) {
++		device_lock(usb->dev);
++		ret = qkx_usb_valid(usb) ? usb_gadget_connect(usb->gadget) : -ENODEV;
++		device_unlock(usb->dev);
++	}
++	put_device(&usb->gadget->dev);
++	put_device(usb->dev);
++	module_put(usb->owner);
++	memset(usb, 0, sizeof(*usb));
++	return ret;
++}
++
++static bool qkx_watchdog_valid(struct qkx_watchdog *wdt)
++{
++	return wdt->dev->driver == wdt->driver &&
++		dev_get_drvdata(wdt->dev) == wdt->data;
++}
++
++int qkx_watchdog_get(struct qkx_watchdog *wdt, struct device *dev,
++		     bool retain, bool timing)
++{
++	struct msm_watchdog_data *data;
++	int ret = -ENODEV;
++
++	/* No get-bite-time operation exists: do not guess a rollback value. */
++	if (timing)
++		return -EOPNOTSUPP;
++	if (!dev)
++		return ret;
++	device_lock(dev);
++	if (!dev->driver || strcmp(dev->driver->name, "gh-watchdog") ||
++	    (!of_device_is_compatible(dev->of_node, "qcom,gh-watchdog") &&
++	     !of_device_is_compatible(dev->of_node, "qcom,hh-watchdog")))
++		goto out;
++	data = dev_get_drvdata(dev);
++	if (!data || data->dev != dev || !data->ops ||
++	    !data->ops->reset_wdt || !data->ops->disable_wdt ||
++	    !data->ops->enable_wdt || IS_ERR_OR_NULL(data->watchdog_task))
++		goto out;
++	/* A disabled/panic-only driver may not have initialized its timers. */
++	ret = -EOPNOTSUPP;
++	if (!data->enabled)
++		goto out;
++	if (!try_module_get(dev->driver->owner))
++		goto out;
++	wdt->dev = get_device(dev);
++	wdt->driver = dev->driver;
++	wdt->data = data;
++	wdt->owner = dev->driver->owner;
++	wdt->retained = retain;
++	ret = 0;
++out:
++	device_unlock(dev);
++	return ret;
++}
++
++/* device_lock and disable_lock must be held. Unlike the exported PM helpers,
++ * every hardware callback here has its return value checked.
++ */
++static int qkx_watchdog_restore(struct qkx_watchdog *wdt)
++{
++	struct msm_watchdog_data *data = wdt->data;
++	unsigned long flags;
++	int ret = 0, err;
++
++	if (!wdt->suspended)
++		return 0;
++	if (wdt->disable_attempted) {
++		/* Force the callback to contact the hypervisor even if disable
++		 * failed after a partial change. An ambiguous result is an error,
++		 * not proof that the original hardware state was restored.
++		 */
++		WRITE_ONCE(data->enabled, false);
++		ret = data->ops->enable_wdt(3, data);
++		WRITE_ONCE(data->enabled, true);
++		if (ret)
++			pr_err("quest_kexec: watchdog enable failed; hardware state uncertain: %d\n", ret);
++	}
++	err = data->ops->reset_wdt(data);
++	ret = qkx_restore_error(ret, err, "watchdog reset");
++	if (!err)
++		data->last_pet = sched_clock();
++	/* Resume pet scheduling even if the hypervisor rejected restoration. */
++	spin_lock_irqsave(&data->freeze_lock, flags);
++	data->freeze_in_progress = false;
++	if (wdt->pet_pending)
++		mod_timer(&data->pet_timer, jiffies + msecs_to_jiffies(data->pet_time));
++	spin_unlock_irqrestore(&data->freeze_lock, flags);
++	if (wdt->user_pending)
++		mod_timer(&data->user_pet_timer,
++			  jiffies + msecs_to_jiffies(data->bark_time + 3000));
++	wdt->suspended = false;
++	return ret;
++}
++
++int qkx_watchdog_prepare(struct qkx_watchdog *wdt)
++{
++	struct msm_watchdog_data *data = wdt->data;
++	unsigned long flags;
++	int ret = -ENODEV;
++
++	if (!wdt->dev)
++		return ret;
++	device_lock(wdt->dev);
++	if (!qkx_watchdog_valid(wdt))
++		goto out_device;
++	mutex_lock(&data->disable_lock);
++	ret = -EBUSY;
++	if (!data->enabled || data->in_panic || wdt->suspended)
++		goto out;
++	spin_lock_irqsave(&data->freeze_lock, flags);
++	if (data->freeze_in_progress) {
++		spin_unlock_irqrestore(&data->freeze_lock, flags);
++		goto out;
++	}
++	data->freeze_in_progress = true;
++	spin_unlock_irqrestore(&data->freeze_lock, flags);
++	wdt->suspended = true;
++	/* del_timer_sync also waits for callbacks already running. Always
++	 * restart the pet timer: the pet thread may have consumed the previous
++	 * expiration while freeze_in_progress prevented it from rearming.
++	 */
++	wdt->pet_pending = true;
++	del_timer_sync(&data->pet_timer);
++	wdt->user_pending = data->user_pet_enabled;
++	if (wdt->user_pending)
++		del_timer_sync(&data->user_pet_timer);
++	ret = data->ops->reset_wdt(data);
++	if (ret)
++		goto out;
++	data->last_pet = sched_clock();
++	if (!wdt->retained) {
++		wdt->disable_attempted = true;
++		ret = data->ops->disable_wdt(data);
++		if (!ret)
++			WRITE_ONCE(data->enabled, false);
++	}
++out:
++	mutex_unlock(&data->disable_lock);
++out_device:
++	device_unlock(wdt->dev);
++	/* Caller performs reverse-order rollback, including partial failures. */
++	return ret;
++}
++
++int qkx_watchdog_finish(struct qkx_watchdog *wdt, bool recovery)
++{
++	struct msm_watchdog_data *data = wdt->data;
++	int ret = -ENODEV;
++
++	if (!wdt->dev)
++		return ret;
++	device_lock(wdt->dev);
++	if (!qkx_watchdog_valid(wdt))
++		goto out_device;
++	mutex_lock(&data->disable_lock);
++	ret = -EINVAL;
++	if (!wdt->suspended)
++		goto out;
++	ret = 0;
++	if (!wdt->retained)
++		goto out;
++	if (recovery) {
++		ret = data->ops->reset_wdt(data);
++		if (!ret)
++			data->last_pet = sched_clock();
++	} else {
++		wdt->disable_attempted = true;
++		ret = data->ops->disable_wdt(data);
++		if (!ret)
++			WRITE_ONCE(data->enabled, false);
++	}
++out:
++	mutex_unlock(&data->disable_lock);
++out_device:
++	device_unlock(wdt->dev);
++	return ret;
++}
++
++int qkx_watchdog_put(struct qkx_watchdog *wdt, bool rollback)
++{
++	int ret = 0;
++
++	if (!wdt->dev)
++		return 0;
++	if (rollback && wdt->suspended) {
++		device_lock(wdt->dev);
++		if (qkx_watchdog_valid(wdt)) {
++			mutex_lock(&wdt->data->disable_lock);
++			ret = qkx_watchdog_restore(wdt);
++			mutex_unlock(&wdt->data->disable_lock);
++		} else {
++			ret = -ENODEV;
++		}
++		device_unlock(wdt->dev);
++	}
++	put_device(wdt->dev);
++	module_put(wdt->owner);
++	memset(wdt, 0, sizeof(*wdt));
++	return ret;
++}
++
++int qkx_platform_abort(struct qkx_usb *usb, struct qkx_watchdog *wdt, int error)
++{
++	error = qkx_restore_error(error, qkx_watchdog_put(wdt, true), "watchdog");
++	return qkx_restore_error(error, qkx_usb_put(usb, true), "USB");
++}
+--- /dev/null
++++ b/module/quest3-platform.h
+@@ -0,0 +1,37 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#ifndef QKX_QUEST3_PLATFORM_H
++#define QKX_QUEST3_PLATFORM_H
++#include <linux/device.h>
++#include <linux/module.h>
++#include <linux/usb/gadget.h>
++#include <soc/qcom/watchdog.h>
++struct qkx_usb {
++	struct device *dev;
++	struct device_driver *driver;
++	struct usb_gadget *gadget;
++	struct module *owner;
++	bool was_connected;
++	bool attempted;
++};
++struct qkx_watchdog {
++	struct device *dev;
++	struct device_driver *driver;
++	struct msm_watchdog_data *data;
++	struct module *owner;
++	bool retained;
++	bool suspended;
++	bool disable_attempted;
++	bool pet_pending;
++	bool user_pending;
++};
++int qkx_usb_get(struct qkx_usb *usb, struct device *dev);
++int qkx_usb_disconnect(struct qkx_usb *usb);
++int qkx_usb_put(struct qkx_usb *usb, bool rollback);
++int qkx_watchdog_get(struct qkx_watchdog *wdt, struct device *dev,
++		     bool retain, bool timing);
++int qkx_watchdog_prepare(struct qkx_watchdog *wdt);
++int qkx_watchdog_finish(struct qkx_watchdog *wdt, bool recovery);
++int qkx_watchdog_put(struct qkx_watchdog *wdt, bool rollback);
++int qkx_restore_error(int primary, int cleanup, const char *operation);
++int qkx_platform_abort(struct qkx_usb *usb, struct qkx_watchdog *wdt, int error);
++#endif

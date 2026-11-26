@@ -1,0 +1,287 @@
+--- a/module/loader.c
++++ b/module/loader.c
+@@ -28,7 +28,7 @@
+ #include <asm/pgtable.h>
+ #include <asm/sysreg.h>
+ #include <asm/unaligned.h>
+-#include <soc/qcom/scm.h>
++#include "quest3-scm.h"
+ #include "core.h" /* Matching kernel's drivers/usb/dwc3; no guessed offsets. */
+ 
+ extern void qkx_flush_dcache_area(void *addr, size_t len);
+@@ -91,7 +91,7 @@
+ module_param(disconnect_qmp, bool, 0);
+ MODULE_PARM_DESC(disconnect_qmp, "Cleanly close Android AOP QMP channels and publish mcore LINK_DOWN before kexec");
+ MODULE_PARM_DESC(core_hang_control, "0: untouched; 1: report secure core-hang registers; 2: clear enable bit");
+-MODULE_PARM_DESC(secure_watchdog_control, "0: untouched; 1: report SCM availability; 2: try supported secure-watchdog disable signatures");
++MODULE_PARM_DESC(secure_watchdog_control, "0: untouched; 1: report SCM driver readiness only; 2: qcom_scm_sec_wdog_deactivate");
+ MODULE_PARM_DESC(phase_delay_ms, "Pause at pre-freeze checkpoints, maximum 5000 ms");
+ MODULE_PARM_DESC(preflight_only, "1: preflight; 2: GPU rehearsal; 3: combined CPU/physical rehearsal");
+ MODULE_PARM_DESC(preserve_watchdog, "Hand watchdog to target: bypass rejected secure disable");
+@@ -210,7 +210,7 @@
+ 
+ 	/* A kprobe address is not a typed CFI call target. Fail before probing. */
+ 	if (IS_ENABLED(CONFIG_CFI_CLANG)) {
+-		pr_err("quest_kexec: CFI blocks private-symbol paths: execute (including preflight), test_cpus, warm_reset_test, core_hang_control, secure_watchdog_control; exported-API port required\n");
++		pr_err("quest_kexec: CFI blocks private-symbol paths: execute (including preflight), test_cpus, warm_reset_test; exported-API port required\n");
+ 		return -EOPNOTSUPP;
+ 	}
+ 	ret = register_kprobe(&kp);
+@@ -965,67 +965,6 @@
+ 	return ret;
+ }
+ 
+-static int qkx_core_hang_configure(void)
+-{
+-	static const phys_addr_t config[] = {
+-		0x18000060, 0x18010060, 0x18020060, 0x18030060,
+-		0x18040060, 0x18050060, 0x18060060, 0x18070060,
+-	};
+-	u32 (*secure_read)(phys_addr_t) = (void *)lookup("scm_io_read");
+-	int (*secure_write)(phys_addr_t, u32) = (void *)lookup("scm_io_write");
+-	unsigned int i;
+-
+-	if (!secure_read || (core_hang_control == 2 && !secure_write))
+-		return -ENOENT;
+-	for (i = 0; i < ARRAY_SIZE(config); i++) {
+-		u32 before = secure_read(config[i]);
+-		int ret = 0;
+-		u32 after = before;
+-
+-		if (core_hang_control == 2 && (before & BIT(1))) {
+-			ret = secure_write(config[i], before & ~BIT(1));
+-			after = secure_read(config[i]);
+-		}
+-		pr_emerg("quest_kexec: core-hang cpu%u config=%pa before=%08x after=%08x write=%d\n",
+-			i, &config[i], before, after, ret);
+-		if (ret || (core_hang_control == 2 && (after & BIT(1))))
+-			return ret ? ret : -EIO;
+-	}
+-	return 0;
+-}
+-
+-static int qkx_secure_watchdog_configure(void)
+-{
+-	int (*available)(u32, u32) = (void *)lookup("scm_is_call_available");
+-	int (*call)(u32, struct scm_desc *) = (void *)lookup("scm_call2");
+-	struct scm_desc desc = { };
+-	int avail, ret;
+-
+-	if (!available || !call)
+-		return -ENOENT;
+-	avail = available(SCM_SVC_BOOT, 0x7);
+-	pr_emerg("quest_kexec: secure-watchdog disable SCM availability=%d\n", avail);
+-	if (secure_watchdog_control != 2)
+-		return avail < 0 ? avail : 0;
+-
+-	/* This firmware rejects the downstream driver's one-argument value 1.
+-	 * Probe the older no-argument and one-argument-zero ABIs in that order.
+-	 */
+-	desc.arginfo = SCM_ARGS(0);
+-	ret = call(SCM_SIP_FNID(SCM_SVC_BOOT, 0x7), &desc);
+-	pr_emerg("quest_kexec: secure-watchdog disable noarg ret=%d secure=%llx/%llx/%llx\n",
+-		ret, desc.ret[0], desc.ret[1], desc.ret[2]);
+-	if (!ret)
+-		return 0;
+-	memset(&desc, 0, sizeof(desc));
+-	desc.arginfo = SCM_ARGS(1);
+-	desc.args[0] = 0;
+-	ret = call(SCM_SIP_FNID(SCM_SVC_BOOT, 0x7), &desc);
+-	pr_emerg("quest_kexec: secure-watchdog disable arg0 ret=%d secure=%llx/%llx/%llx\n",
+-		ret, desc.ret[0], desc.ret[1], desc.ret[2]);
+-	return ret;
+-}
+-
+ static int __init qkx_init(void)
+ {
+ 	struct file *kf = NULL, *rf = NULL, *df = NULL;
+@@ -1052,8 +991,7 @@
+ 	if (!of_machine_is_compatible("qcom,anorak"))
+ 		return -ENODEV;
+ 	/* Reject all private-symbol modes before any hardware/state changes. */
+-	if (execute || test_cpus || warm_reset_test || core_hang_control ||
+-	    secure_watchdog_control) {
++	if (execute || test_cpus || warm_reset_test) {
+ 		ret = qkx_resolve();
+ 		if (ret)
+ 			return ret;
+@@ -1071,12 +1009,12 @@
+ 		return -EIO;
+ 	}
+ 	if (core_hang_control) {
+-		ret = qkx_core_hang_configure();
++		ret = qkx_core_hang_configure(core_hang_control);
+ 		if (ret)
+ 			return ret;
+ 	}
+ 	if (secure_watchdog_control) {
+-		ret = qkx_secure_watchdog_configure();
++		ret = qkx_secure_watchdog_configure(secure_watchdog_control);
+ 		if (ret)
+ 			return ret;
+ 	}
+--- a/module/Makefile
++++ b/module/Makefile
+@@ -7,7 +7,7 @@
+ ifneq ($(KERNELRELEASE),)
+ obj-m += quest_kexec.o marker_read.o
+ obj-m += usb_log.o
+-quest_kexec-y := loader.o transition.o
++quest_kexec-y := loader.o transition.o quest3-scm.o
+ # Without this define the module can only stage (execute=1 is refused).
+ ccflags-y += -DQKX_ENABLE_EXPERIMENTAL_JUMP
+ ccflags-y += -I$(srctree)/drivers/usb/dwc3
+--- /dev/null
++++ b/module/quest3-scm.c
+@@ -0,0 +1,142 @@
++// SPDX-License-Identifier: GPL-2.0
++#include <linux/cpu.h>
++#include <linux/errno.h>
++#include <linux/of.h>
++#include <linux/qcom_scm.h>
++#include <linux/slab.h>
++#include "quest3-scm.h"
++
++struct qkx_core_reg {
++	phys_addr_t address;
++	u32 original;
++	bool changed;
++};
++
++int qkx_core_hang_configure(unsigned int mode)
++{
++	struct device_node *node;
++	struct of_phandle_args args;
++	struct qkx_core_reg *regs;
++	int cells, entries, i, j, cpu, ret = -ENODEV;
++
++	if (!mode)
++		return 0;
++	if (mode > 2)
++		return -EINVAL;
++
++	if (!qcom_scm_is_available())
++		return -ENODEV;
++	node = of_find_compatible_node(NULL, NULL, "qcom,core-hang-detect");
++	if (!node)
++		return -ENODEV;
++	if (!of_device_is_available(node))
++		goto out_node;
++	cells = of_property_count_u32_elems(node, "qcom,chd-percpu-info");
++	ret = -EINVAL;
++	if (cells <= 0 || cells % 3)
++		goto out_node;
++	entries = cells / 3;
++	regs = kcalloc(nr_cpu_ids, sizeof(*regs), GFP_KERNEL);
++	if (!regs) {
++		ret = -ENOMEM;
++		goto out_node;
++	}
++	/* Same DT schema as drivers/soc/qcom/core_hang_detect.c. Validate the
++	 * entire list before accessing firmware or changing any register.
++	 */
++	for (i = 0; i < entries; i++) {
++		ret = of_parse_phandle_with_fixed_args(node, "qcom,chd-percpu-info",
++						     2, i, &args);
++		if (ret)
++			goto out;
++		cpu = of_cpu_node_to_id(args.np);
++		of_node_put(args.np);
++		if (cpu < 0 || cpu >= nr_cpu_ids || !cpu_possible(cpu))
++			continue;
++		ret = -EINVAL;
++		if (!args.args[1] || (args.args[1] & 3) || regs[cpu].address)
++			goto out;
++		/* Different CPUs must not alias the same configuration register. */
++		for (j = 0; j < nr_cpu_ids; j++)
++			if (regs[j].address == args.args[1])
++				goto out;
++		regs[cpu].address = args.args[1];
++	}
++	for_each_possible_cpu(cpu) {
++		ret = -EINVAL;
++		if (!regs[cpu].address)
++			goto out;
++	}
++	for_each_possible_cpu(cpu) {
++		ret = qcom_scm_io_readl(regs[cpu].address, &regs[cpu].original);
++		if (ret)
++			goto out;
++		pr_info("quest_kexec: core-hang cpu%d config=%pa value=%08x\n",
++			cpu, &regs[cpu].address, regs[cpu].original);
++	}
++	if (mode == 2) {
++		for_each_possible_cpu(cpu) {
++			u32 value;
++
++			if (!(regs[cpu].original & BIT(1)))
++				continue;
++			/* A failing write may have reached firmware: include it in rollback. */
++			regs[cpu].changed = true;
++			ret = qcom_scm_io_writel(regs[cpu].address,
++						regs[cpu].original & ~BIT(1));
++			if (ret)
++				goto rollback;
++			ret = qcom_scm_io_readl(regs[cpu].address, &value);
++			if (ret)
++				goto rollback;
++			if (value != (regs[cpu].original & ~BIT(1))) {
++				ret = -EIO;
++				goto rollback;
++			}
++		}
++	}
++	ret = 0;
++	goto out;
++rollback:
++	for_each_possible_cpu(cpu) {
++		u32 restored;
++		int err;
++
++		if (!regs[cpu].changed)
++			continue;
++		err = qcom_scm_io_writel(regs[cpu].address, regs[cpu].original);
++		if (!err)
++			err = qcom_scm_io_readl(regs[cpu].address, &restored);
++		if (!err && restored != regs[cpu].original)
++			err = -EIO;
++		if (err)
++			pr_err("quest_kexec: core-hang rollback failed for cpu%d: %d\n", cpu, err);
++	}
++out:
++	kfree(regs);
++out_node:
++	of_node_put(node);
++	return ret;
++}
++
++int qkx_secure_watchdog_configure(unsigned int mode)
++{
++	int ret;
++
++	if (!mode)
++		return 0;
++	if (mode > 2)
++		return -EINVAL;
++	/* Driver readiness is not a per-command firmware capability query. */
++	if (!qcom_scm_is_available()) {
++		pr_err("quest_kexec: SCM driver unavailable\n");
++		return -ENODEV;
++	}
++	if (mode == 1) {
++		pr_info("quest_kexec: SCM driver ready; secure-watchdog command not probed\n");
++		return 0;
++	}
++	ret = qcom_scm_sec_wdog_deactivate();
++	pr_info("quest_kexec: secure-watchdog deactivate returned %d\n", ret);
++	return ret;
++}
+--- /dev/null
++++ b/module/quest3-scm.h
+@@ -0,0 +1,6 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#ifndef QKX_QUEST3_SCM_H
++#define QKX_QUEST3_SCM_H
++int qkx_core_hang_configure(unsigned int mode);
++int qkx_secure_watchdog_configure(unsigned int mode);
++#endif
